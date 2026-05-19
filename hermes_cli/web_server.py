@@ -10,6 +10,7 @@ Usage:
 """
 
 import asyncio
+import gzip
 import hmac
 import importlib.util
 import json
@@ -3729,7 +3730,6 @@ def mount_spa(application: FastAPI):
         if prefix:
             vary_values.append("x-forwarded-prefix")
         if _accepts_gzip_static(accept_encoding):
-            import gzip
             content = css.encode("utf-8")
             compressed = gzip.compress(content, compresslevel=6)
             if len(compressed) < len(content):
@@ -3798,7 +3798,6 @@ def mount_spa(application: FastAPI):
                     response.headers["cache-control"] = "public, max-age=31536000, immutable"
                 # Gzip compress if client supports it (honors q=0)
                 if self._accepts_gzip(accept_encoding) and isinstance(response, FileResponse):
-                    import gzip
                     file_path = response.path
                     try:
                         file_size = os.path.getsize(file_path)
