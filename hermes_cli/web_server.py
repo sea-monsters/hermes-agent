@@ -3722,42 +3722,68 @@ def mount_spa(application: FastAPI):
                 css = css.replace(f"url({asset_dir}", f"url({prefix}{asset_dir}")
                 css = css.replace(f"url(\"{asset_dir}", f"url(\"{prefix}{asset_dir}")
                 css = css.replace(f"url('{asset_dir}", f"url('{prefix}{asset_dir}")
-        return Response(content=css, media_type="text/css")
+        # Apply gzip compression + cache headers for CSS assets
+        accept_encoding = request.headers.get("accept-encoding", "")
+        if _accepts_gzip_static(accept_encoding):
+            import gzip
+            content = css.encode("utf-8")
+            compressed = gzip.compress(content, compresslevel=6)
+            if len(compressed) < len(content):
+                headers = {
+                    "content-encoding": "gzip",
+                    "vary": "accept-encoding",
+                    "content-length": str(len(compressed)),
+                    "cache-control": "public, max-age=31536000, immutable",
+                }
+                if request.method == "HEAD":
+                    return Response(headers=headers, media_type="text/css")
+                return Response(content=compressed, headers=headers, media_type="text/css")
+        # Fallback: uncompressed with cache header
+        return Response(
+            content=css,
+            media_type="text/css",
+            headers={"cache-control": "public, max-age=31536000, immutable"},
+        )
+
+    def _accepts_gzip_static(accept_encoding: str) -> bool:
+        """Parse Accept-Encoding header and return True if gzip is accepted (q > 0).
+
+        Handles:
+        - Basic encodings: gzip, x-gzip (RFC 2616 alias)
+        - Quality values: gzip;q=0.5, gzip;q=0 (including spaced: gzip; q=0)
+        - Multiple parameters: gzip;q=0.5;ext=foo
+        - Case insensitive matching
+
+        Shared between serve_css and _OptimizedStaticFiles.
+        """
+        if not accept_encoding:
+            return False
+        for encoding in accept_encoding.split(","):
+            encoding = encoding.strip()
+            if not encoding:
+                continue
+            # Match gzip or x-gzip at start (case insensitive, word boundary)
+            match = re.match(r"^(gzip|x-gzip)\b", encoding, re.IGNORECASE)
+            if not match:
+                continue
+            # Get parameters after the encoding name
+            params = encoding[match.end():]
+            # Look for q parameter with valid numeric value (allow optional whitespace after ;)
+            q_match = re.search(r";\s*q=([0-9]+(?:\.[0-9]+)?)(?:;|$|\s)", params)
+            if q_match:
+                return float(q_match.group(1)) > 0
+            # Check for malformed q (q without valid =value)
+            if re.search(r";\s*q\b", params):
+                return False
+            return True  # No q parameter, default accept
+        return False
 
     # Serve gzip-compressed static files with long-term cache headers.
     # Reduces bandwidth (1.5 MB -> 450 KB for main JS bundle) and allows
     # browser caching since filenames contain content hashes.
     class _OptimizedStaticFiles(StaticFiles):
         def _accepts_gzip(self, accept_encoding: str) -> bool:
-            """Parse Accept-Encoding header and return True if gzip is accepted (q > 0).
-            
-            Handles:
-            - Basic encodings: gzip, x-gzip (RFC 2616 alias)
-            - Quality values: gzip;q=0.5, gzip;q=0
-            - Multiple parameters: gzip;q=0.5;ext=foo
-            - Case insensitive matching
-            """
-            if not accept_encoding:
-                return False
-            for encoding in accept_encoding.split(","):
-                encoding = encoding.strip()
-                if not encoding:
-                    continue
-                # Match gzip or x-gzip at start (case insensitive, word boundary)
-                match = re.match(r"^(gzip|x-gzip)\b", encoding, re.IGNORECASE)
-                if not match:
-                    continue
-                # Get parameters after the encoding name
-                params = encoding[match.end():]
-                # Look for q parameter with valid numeric value
-                q_match = re.search(r";q=([0-9]+(?:\.[0-9]+)?)(?:;|$|\s)", params)
-                if q_match:
-                    return float(q_match.group(1)) > 0
-                # Check for malformed q (q without valid =value)
-                if re.search(r";q\b", params):
-                    return False
-                return True  # No q parameter, default accept
-            return False
+            return _accepts_gzip_static(accept_encoding)
 
         async def get_response(self, path: str, scope):
             response = await super().get_response(path, scope)
