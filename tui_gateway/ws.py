@@ -166,11 +166,10 @@ async def handle_ws(ws: Any) -> None:
     finally:
         transport.close()
 
-        # Detach the transport from any sessions it owned so later emits
-        # fall back to stdio instead of crashing into a closed socket.
-        for _, sess in list(server._sessions.items()):
-            if sess.get("transport") is transport:
-                sess["transport"] = server._stdio_transport
+        # Close short-lived sessions (close_on_disconnect=True) eagerly and
+        # kill their slash_worker.  Normal sessions fall back to stdio so the
+        # session can be picked up by a future WS or remain usable via /resume.
+        server._close_sessions_on_transport(transport, end_reason="ws_disconnect")
 
         try:
             await ws.close()

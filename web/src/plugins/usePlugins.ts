@@ -52,17 +52,12 @@ export function usePlugins() {
         }
       }
 
-      // Load JS bundle. In dev, cache-bust so Vite HMR can clear the
-      // in-memory registry while the browser would otherwise never
-      // re-execute a previously cached <script> URL.
+      // Load JS bundle. Cache-bust in both dev and production so plugin
+      // updates are picked up without a hard browser refresh.
       const baseUrl = `${HERMES_BASE_PATH}/dashboard-plugins/${manifest.name}/${manifest.entry}`;
-      const scriptSrc = import.meta.env.DEV
-        ? `${baseUrl}?hermes_dv=${Date.now()}`
-        : baseUrl;
-      if (!import.meta.env.DEV) {
-        if (loadedScripts.current.has(baseUrl)) continue;
-        loadedScripts.current.add(baseUrl);
-      }
+      const scriptSrc = `${baseUrl}?v=${Date.now()}`;
+      if (loadedScripts.current.has(baseUrl)) continue;
+      loadedScripts.current.add(baseUrl);
 
       const script = document.createElement("script");
       script.setAttribute("data-hermes-plugin", manifest.name);

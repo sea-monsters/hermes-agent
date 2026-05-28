@@ -336,6 +336,70 @@ def _shutdown_sessions() -> None:
 atexit.register(_shutdown_sessions)
 
 
+# ── Session teardown helpers (sea-monsters: WS-disconnect cleanup) ───
+
+
+def _coerce_close_on_disconnect(value: object) -> bool:
+    """Normalise ``close_on_disconnect`` from JSON-RPC params to a bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if value is None:
+        return False
+    return bool(value)
+
+
+def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
+    """Pop and fully tear down a session: finalize, close agent + worker.
+
+    Shared by ``session.close`` RPC, WebSocket-disconnect cleanup, and
+    server shutdown — guarantees all teardown paths are identical.
+    """
+    session = _sessions.pop(sid, None)
+    if not session:
+        return False
+    _finalize_session(session, end_reason=end_reason)
+    try:
+        from tools.approval import unregister_gateway_notify
+
+        unregister_gateway_notify(session["session_key"])
+    except Exception:
+        pass
+    try:
+        agent = session.get("agent")
+        if agent and hasattr(agent, "close"):
+            agent.close()
+    except Exception:
+        pass
+    try:
+        worker = session.get("slash_worker")
+        if worker:
+            worker.close()
+    except Exception:
+        pass
+    return True
+
+
+def _close_sessions_on_transport(
+    transport: object, *, end_reason: str = "ws_disconnect"
+) -> None:
+    """Tear down (or migrate) sessions owned by a particular transport.
+
+    * Sessions marked ``close_on_disconnect=True`` (sidecar / short-lived)
+      are eagerly finalised and their ``slash_worker`` is killed.
+    * Normal sessions fall back to the stdio transport so the session can
+      be reconnected later — historical ``handle_ws`` behaviour.
+    """
+    for sid, session in list(_sessions.items()):
+        if session.get("transport") is not transport:
+            continue
+        if session.get("close_on_disconnect"):
+            _close_session_by_id(sid, end_reason=end_reason)
+        else:
+            session["transport"] = _stdio_transport
+
+
 # ── Plumbing ──────────────────────────────────────────────────────────
 
 
