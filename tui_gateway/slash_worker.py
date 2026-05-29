@@ -2,18 +2,16 @@
 
 Protocol: reads JSON lines from stdin {id, command}, writes {id, ok, output|error} to stdout.
 
-Three-layer defence-in-depth against orphaned subprocesses:
-
-1. **Parent watchdog (P1, psutil)** — a daemon thread monitors the parent's
-   PID + create_time fingerprint every 10 s and exits if the parent disappears.
-   Handles crashes, SIGKILL, and PID reuse.
-2. **Idle timeout + getppid() poll (P1, no deps)** — the main stdin loop
-   uses select.select() with a 60 s timeout so it can periodically check
-   os.getppid() and a 30-minute idle deadline. Works without psutil.
-3. **Server-side cleanup (P0)** — when a WebSocket disconnects, sessions
-   marked close_on_disconnect=true are finalised and their worker is killed.
-   Normal TUI sessions still fall back to the stdio transport for historical
-   reconnect compatibility.
+Self-protection (defence-in-depth against orphaned workers):
+  1. **Parent watchdog** (best-effort) — if ``psutil`` is available, a daemon
+     thread monitors the parent's PID + create_time fingerprint every 10 s and
+     exits if the parent disappears. This handles crashes, SIGKILL, and PID
+     reuse (critical on Windows).
+  2. **Parent-PID poll** (fallback) — the main loop checks ``os.getppid()``
+     on each stdin timeout; works without ``psutil`` but cannot detect PID reuse.
+  3. **Idle timeout** — exits after ``_IDLE_TIMEOUT_S`` (30 min) without a
+     command, bounding worst-case resource usage even if both parent-orphan
+     guards fail.
 """
 
 import argparse
@@ -30,47 +28,57 @@ import cli as cli_mod
 from cli import HermesCLI
 from rich.console import Console
 
-
-# ── Parent watchdog (P1, psutil) ──────────────────────────────────────
-# A daemon thread monitors the parent's PID + create_time fingerprint
-# every 10 s and exits if the parent disappears. Handles crashes, SIGKILL,
-# and PID reuse (critical on Windows).
-
-_HAS_PSUTIL: bool = False
-_PARENT_PID: int = os.getppid()
-_PARENT_CREATE_TIME: float | None = None
-
+# ── Optional psutil for parent fingerprinting ────────────────────────
 try:
-    import psutil as _psutil
-
-    _HAS_PSUTIL = True
-    try:
-        _parent_proc = _psutil.Process(_PARENT_PID)
-        _PARENT_CREATE_TIME = _parent_proc.create_time()
-    except Exception:
-        pass
+    import psutil
 except ImportError:
-    pass
+    psutil = None
+
+# Max seconds of inactivity before the worker self-exits.
+_IDLE_TIMEOUT_S = 1800  # 30 minutes
+
+# How often the stdin poll returns to re-check conditions when idle.
+_POLL_INTERVAL_S = 60
 
 
-def _parent_watchdog() -> None:
-    """Daemon thread: exit if the parent PID + create_time don't match."""
-    if not _HAS_PSUTIL or _PARENT_CREATE_TIME is None:
-        return  # fall through to getppid() poll in main loop
-    while True:
-        time.sleep(10)
-        try:
-            pp = _psutil.Process(_PARENT_PID)
-            if pp.create_time() != _PARENT_CREATE_TIME:
+def _start_parent_watchdog() -> None:
+    """Start a daemon thread that exits this process if the parent disappears.
+
+    Uses ``psutil.Process(ppid).create_time()`` as a fingerprint to reliably
+    detect parent replacement (PID reuse).  Falls back to no-op when psutil
+    is not installed — the main loop's ``getppid()`` check provides a less
+    robust but dependency-free alternative.
+    """
+    if not psutil:
+        return
+
+    ppid = os.getppid()
+    try:
+        parent = psutil.Process(ppid)
+        parent_started = parent.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        os._exit(0)  # parent already gone
+
+    def _watch() -> None:
+        time.sleep(5)  # let the main process stabilise
+        while True:
+            try:
+                if not psutil.pid_exists(ppid):
+                    os._exit(0)
+                # Fingerprint check — catches PID reuse on Windows / fast-restart
+                if psutil.Process(ppid).create_time() != parent_started:
+                    os._exit(0)
+                # POSIX orphan check: adopted by init
+                if os.name != "nt" and os.getppid() == 1:
+                    os._exit(0)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
                 os._exit(0)
-        except _psutil.NoSuchProcess:
-            os._exit(0)
+            except Exception:
+                pass  # transient psutil error — retry
+            time.sleep(10)
 
-
-# ── Idle deadline ─────────────────────────────────────────────────────
-_IDLE_TIMEOUT_S: int = 30 * 60  # 30 minutes
-_STDIN_POLL_S: int = 60  # check getppid() every 60 s even without input
-_LAST_ACTIVITY: float = time.time()
+    t = threading.Thread(target=_watch, daemon=True, name="ParentWatchdog")
+    t.start()
 
 
 def _run(cli: HermesCLI, command: str) -> str:
@@ -102,6 +110,8 @@ def _run(cli: HermesCLI, command: str) -> str:
 
 
 def main():
+    _start_parent_watchdog()
+
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--session-key", required=True)
     p.add_argument("--model", default="")
@@ -113,35 +123,42 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
 
-    # Layer 1: parent watchdog thread (psutil)
-    threading.Thread(target=_parent_watchdog, daemon=True).start()
+    parent_pid = os.getppid()
+    last_command_time = time.monotonic()
 
-    # Layer 2: idle timeout + getppid() poll — use select() so we can
-    # periodically check os.getppid() even when no input arrives.
-    global _LAST_ACTIVITY
     while True:
+        # Guard 1: parent-PID check (works without psutil, covers basic
+        # orphan scenarios but not PID reuse).
+        if os.getppid() != parent_pid:
+            break
+
+        # Guard 2: idle timeout — bounds resource use when the upstream
+        # cleanup path (close_on_disconnect + server-side teardown) misses
+        # a code path.
+        idle = time.monotonic() - last_command_time
+        if idle >= _IDLE_TIMEOUT_S:
+            break
+
+        # Poll stdin with a timeout so we can periodically re-check the
+        # conditions above. Without this, a blocking ``for raw in sys.stdin``
+        # would hang forever if the pipe is left open.
+        poll_timeout = min(_POLL_INTERVAL_S, _IDLE_TIMEOUT_S - idle)
         try:
-            rlist, _, _ = select.select([sys.stdin], [], [], _STDIN_POLL_S)
-        except (ValueError, InterruptedError):
-            break
+            r, _, _ = select.select([sys.stdin], [], [], poll_timeout)
+        except (ValueError, OSError):
+            break  # stdin closed or invalid
 
-        if not rlist:
-            # Timeout — poll parent and idle deadline
-            if _PARENT_PID != os.getppid():
-                os._exit(0)
-            if time.time() - _LAST_ACTIVITY > _IDLE_TIMEOUT_S:
-                os._exit(0)
-            continue
+        if not r:
+            continue  # Timeout — loop back to check parent/idle
 
-        raw = rlist[0].readline()
+        raw = sys.stdin.readline()
         if not raw:
-            break
+            break  # EOF — stdin closed
 
         line = raw.strip()
         if not line:
             continue
 
-        _LAST_ACTIVITY = time.time()
         rid = None
         try:
             req = json.loads(line)
@@ -149,6 +166,7 @@ def main():
             out = _run(cli, req.get("command", ""))
             sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": out}) + "\n")
             sys.stdout.flush()
+            last_command_time = time.monotonic()
         except Exception as e:
             sys.stdout.write(json.dumps({"id": rid, "ok": False, "error": str(e)}) + "\n")
             sys.stdout.flush()

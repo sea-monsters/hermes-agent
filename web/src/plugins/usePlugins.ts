@@ -52,12 +52,14 @@ export function usePlugins() {
         }
       }
 
-      // Load JS bundle. Cache-bust in both dev and production so plugin
-      // updates are picked up without a hard browser refresh.
+      // Load JS bundle. Cache-bust in both dev and production so updates
+      // to plugin files are picked up immediately without hard refresh.
       const baseUrl = `${HERMES_BASE_PATH}/dashboard-plugins/${manifest.name}/${manifest.entry}`;
       const scriptSrc = `${baseUrl}?v=${Date.now()}`;
-      if (loadedScripts.current.has(baseUrl)) continue;
-      loadedScripts.current.add(baseUrl);
+      if (!import.meta.env.DEV) {
+        if (loadedScripts.current.has(baseUrl)) continue;
+        loadedScripts.current.add(baseUrl);
+      }
 
       const script = document.createElement("script");
       script.setAttribute("data-hermes-plugin", manifest.name);

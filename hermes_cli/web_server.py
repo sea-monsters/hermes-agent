@@ -58,6 +58,9 @@ try:
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
+    # First try lazy-installing the dashboard extras. Only the user actually
+    # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
+    # them out of every other install path. After install, re-import.
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
@@ -71,61 +74,6 @@ except ImportError:
             "Web UI requires fastapi and uvicorn.\n"
             f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
         )
-
-
-# ── Optimized static file serving (sea-monsters) ──────────────────────
-# Gzip compression for JS/CSS + long-term Cache-Control headers.
-# Replaces raw StaticFiles when serving hashed Vite assets.
-
-
-class _OptimizedStaticFiles(StaticFiles):
-    """StaticFiles subclass with on-the-fly gzip + Cache-Control.
-
-    * JS/CSS files >= 1 KB are served gzip-encoded when the client includes
-      ``Accept-Encoding: gzip`` in the request (1.5 MB -> 450 KB, 70 %).
-    * Hashed assets get ``public, max-age=31536000, immutable`` so the
-      browser never re-requests them.
-    * Non-hashed / other files fall back to the default StaticFiles handler.
-    """
-
-    async def __get_response(self, path: str, scope):
-        """Intercept the response and add gzip + cache headers."""
-        resp = await super()._get_response(path, scope)
-        if resp.status_code != 200:
-            return resp
-
-        file_path = os.path.join(self.directory, path) if self.directory else path
-        _, ext = os.path.splitext(file_path)
-        ext = ext.lower()
-
-        # -- Long-term cache for hashed assets (Vite: index-DEADBEEF.js) --
-        _hashed_asset_re = re.compile(
-            r"[-_][a-fA-F0-9]{8,}\.(js|css|png|jpg|jpeg|gif|svg|ico|webp|woff2?)$"
-        )
-        if _hashed_asset_re.search(path):
-            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-
-        # -- Gzip JS/CSS --
-        if ext in (".js", ".css", ".mjs", ".cjs"):
-            body = resp.body
-            if body and len(body) > 1024:
-                accept = scope.get("headers", {})
-                if isinstance(accept, list):
-                    accept = dict(accept)
-                ae = accept.get(b"accept-encoding", b"").decode("utf-8", errors="ignore")
-                if "gzip" in ae:
-                    import gzip as _gzip
-
-                    compressed = _gzip.compress(body, compresslevel=6)
-                    if len(compressed) < len(body):
-                        return Response(
-                            content=compressed,
-                            status_code=resp.status_code,
-                            headers=dict(resp.headers) | {"Content-Encoding": "gzip"},
-                            media_type=resp.media_type,
-                        )
-        return resp
-
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
@@ -3961,6 +3909,42 @@ def mount_spa(application: FastAPI):
                 css = css.replace(f"url(\"{asset_dir}", f"url(\"{prefix}{asset_dir}")
                 css = css.replace(f"url('{asset_dir}", f"url('{prefix}{asset_dir}")
         return Response(content=css, media_type="text/css")
+
+    # Serve gzip-compressed static files with long-term cache headers.
+    # Reduces bandwidth (1.5 MB -> 450 KB for main JS bundle) and allows
+    # browser caching since filenames contain content hashes.
+    class _OptimizedStaticFiles(StaticFiles):
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+            if path.endswith(".js") or path.endswith(".css"):
+                headers = dict(scope.get("headers", []))
+                accept_encoding = headers.get(b"accept-encoding", b"").decode("latin-1", "")
+                # Add long-term cache header for hashed filenames (e.g. index-XXXX.js)
+                if "content-type" in response.headers:
+                    response.headers["cache-control"] = "public, max-age=31536000, immutable"
+                # Gzip compress if client supports it
+                if "gzip" in accept_encoding and isinstance(response, FileResponse):
+                    import gzip
+                    file_path = response.path
+                    file_size = os.path.getsize(file_path)
+                    if file_size > 1024:
+                        with open(file_path, "rb") as f:
+                            content = f.read()
+                        compressed = gzip.compress(content, compresslevel=6)
+                        if len(compressed) < len(content):
+                            return Response(
+                                content=compressed,
+                                headers={
+                                    "content-type": response.headers.get("content-type", "application/octet-stream"),
+                                    "content-encoding": "gzip",
+                                    "vary": "accept-encoding",
+                                    "content-length": str(len(compressed)),
+                                    "last-modified": response.headers.get("last-modified", ""),
+                                    "etag": response.headers.get("etag", ""),
+                                    "cache-control": "public, max-age=31536000, immutable",
+                                },
+                            )
+            return response
 
     application.mount("/assets", _OptimizedStaticFiles(directory=WEB_DIST / "assets"), name="assets")
 

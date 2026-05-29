@@ -166,10 +166,10 @@ async def handle_ws(ws: Any) -> None:
     finally:
         transport.close()
 
-        # Close short-lived sessions (close_on_disconnect=True) eagerly and
-        # kill their slash_worker.  Normal sessions fall back to stdio so the
-        # session can be picked up by a future WS or remain usable via /resume.
-        server._close_sessions_on_transport(transport, end_reason="ws_disconnect")
+        # Preserve the historical "session survives reconnect" behaviour for
+        # normal TUI sessions, but eagerly close explicit sidecar sessions
+        # whose slash_worker should not outlive this websocket.
+        server._close_sessions_for_transport(transport, end_reason="ws_disconnect")
 
         try:
             await ws.close()
