@@ -3810,6 +3810,27 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                # ── Approval guard: halt loop when pending ───────────────
+                # If terminal_tool returned approval_pending, the command was
+                # NOT executed.  Do NOT feed tool results back to the LLM for
+                # another call — wait for the user's /approve or /deny instead.
+                if getattr(agent, "_approval_awaiting", False):
+                    logger.info("conversation_loop: halting due to pending approval")
+                    agent._approval_awaiting = False  # consume flag
+                    _turn_exit_reason = "awaiting_approval"
+                    # Insert a user-role sentinel so the gateway picks up the
+                    # intent state.  The actual approval result is delivered
+                    # via /approve or /deny in a new user turn.
+                    messages.append({
+                        "role": "assistant",
+                        "content": (
+                            "⏸️ I'm waiting for your approval on a command before "
+                            "continuing. Please reply with `/approve` to run it, "
+                            "`/deny` to cancel, or ask me to rephrase."
+                        ),
+                    })
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

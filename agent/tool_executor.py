@@ -62,6 +62,32 @@ def _ra():
     return run_agent
 
 
+# =============================================================================
+# Pending approval detection
+# =============================================================================
+
+
+def _has_pending_approval(tool_result: str) -> bool:
+    """Check if a tool result string indicates a command is awaiting user approval.
+
+    Returns True when the terminal tool returned approval_pending, meaning the
+    command was NOT executed and the agent must wait for user consent before
+    retrying.
+    """
+    if not isinstance(tool_result, str) or len(tool_result) < 20:
+        return False
+    try:
+        parsed = json.loads(tool_result)
+        return bool(parsed.get("approval_pending")) or parsed.get("status") == "pending_approval"
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
+# =============================================================================
+# Concurrent tool execution
+# =============================================================================
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -861,6 +887,38 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         messages.append(make_tool_result_message(function_name, _tool_content, tool_call.id))
+
+        # ── Approval guard: pending_approval must STOP the loop ──────────
+        # When terminal_tool returns approval_pending=True, the command was
+        # NOT executed.  We must prevent the LLM from seeing this as a
+        # completed tool call and retrying it.  Inject a sentinel result
+        # that the conversation loop in run_agent.py recognizes and breaks
+        # on, then break our own tool loop.
+        if isinstance(_tool_content, str) and _has_pending_approval(_tool_content):
+            agent._vprint(
+                f"{agent.log_prefix}⏸️ Command requires your approval — "
+                f"waiting for /approve or /deny",
+                force=True,
+            )
+            agent._approval_awaiting = True
+            # Replace the last tool message with a BLOCKED-style message so
+            # the LLM does NOT see clean tool output and retry the command.
+            messages[-1] = make_tool_result_message(
+                function_name,
+                json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "Command requires user approval. Awaiting /approve or /deny.",
+                    "status": "blocked",
+                    "approval_pending": True,
+                }, ensure_ascii=False),
+                tool_call.id,
+            )
+            # Skip remaining tool calls in this batch — they depend on
+            # the blocked command's result or would also trigger approval.
+            for _skipped in assistant_message.tool_calls[i:]:
+                pass  # loop terminated via break below
+            break
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Drain pending steer BETWEEN individual tool calls so the

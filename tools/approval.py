@@ -109,15 +109,23 @@ def _is_gateway_approval_context() -> bool:
     Cron jobs are NEVER gateway-approval contexts even when they originate
     from a gateway platform (cron binds HERMES_SESSION_PLATFORM via
     contextvars for delivery routing). Cron approvals are governed by
-    ``approvals.cron_mode`` config, not interactive resolve — letting cron
-    fall through to the gateway branch would submit a pending approval
-    with no listener and block the job indefinitely.
+        approvals.cron_mode in config.yaml.
+
+    Falls back to os.environ in case contextvar binding is lost across
+    thread boundaries (subprocess, threadpool executor, etc.).
     """
     if env_var_enabled("HERMES_CRON_SESSION"):
         return False
-    if env_var_enabled("HERMES_GATEWAY_SESSION"):
+    # Contextvar check (primary, task-local)
+    platform = _get_session_platform()
+    if platform:
         return True
-    return bool(_get_session_platform())
+    # Fallback: process-env check for resilience against contextvar
+    # leakage across thread boundaries (threadpool, subagent, etc.).
+    # See also tools/approval.py issue discussion in GHSA-qg5c-hvr5-hjgr.
+    if os.environ.get("HERMES_SESSION_PLATFORM") or os.environ.get("HERMES_GATEWAY_SESSION"):
+        return True
+    return False
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME.
