@@ -255,8 +255,8 @@ async def handle_ws(ws: Any) -> None:
                 )
                 break
     finally:
-    if transport is not None:
-        transport.close()
+        if transport is not None:
+            transport.close()
 
     # Preserve the historical "session survives reconnect" behaviour for
     # normal TUI sessions, but eagerly close explicit sidecar sessions
@@ -265,12 +265,12 @@ async def handle_ws(ws: Any) -> None:
 
     detached_sessions = 0
 
-            # Detach the transport from any sessions it owned so later emits
-            # fall back to stdio instead of crashing into a closed socket.
-            for _, sess in list(server._sessions.items()):
-                if sess.get("transport") is transport:
-                    sess["transport"] = server._stdio_transport
-                    detached_sessions += 1
+    # Detach the transport from any sessions it owned so later emits
+    # fall back to stdio instead of crashing into a closed socket.
+    for _, sess in list(server._sessions.items()):
+        if sess.get("transport") is transport:
+            sess["transport"] = server._stdio_transport
+            detached_sessions += 1
         try:
             await ws.close()
         except Exception as exc:
