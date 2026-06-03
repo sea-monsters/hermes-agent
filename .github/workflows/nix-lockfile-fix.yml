@@ -49,8 +49,14 @@ jobs:
       group: auto-fix-main
       cancel-in-progress: true
     steps:
+      # Fork note: the App token secrets (APP_ID / APP_PRIVATE_KEY) are only
+      # available on the upstream repo.  When absent (fork / no GitHub App
+      # installed), skip app-token generation and fall back to GITHUB_TOKEN.
+      # The commit will still be made but won't re-trigger nix.yml — manually
+      # trigger that workflow when needed.
       - name: Generate GitHub App token
         id: app-token
+        continue-on-error: true
         uses: actions/create-github-app-token@7bfa3a4717ef143a604ee0a99d859b8886a96d00  # v1.9.3
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -59,7 +65,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: main
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - uses: ./.github/actions/nix-setup
         with:
