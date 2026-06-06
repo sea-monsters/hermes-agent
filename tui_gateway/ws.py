@@ -275,8 +275,16 @@ async def handle_ws(ws: Any) -> None:
             # per browser refresh — #38591 fallout). Schedule a grace-delayed
             # reap; a quick reconnect / session.resume re-binds a live
             # transport and cancels it (see _ws_session_is_orphaned).
+            #
+            # Sidecar sessions (close_on_disconnect=True) are eagerly closed
+            # — their slash_worker should not outlive this websocket.
             for _sid, sess in list(server._sessions.items()):
-                if sess.get("transport") is transport:
+                if sess.get("transport") is not transport:
+                    continue
+                if sess.get("close_on_disconnect"):
+                    server._close_session_by_id(_sid, end_reason="ws_disconnect")
+                    detached_sessions += 1
+                else:
                     sess["transport"] = server._stdio_transport
                     detached_sessions += 1
                     try:
