@@ -255,6 +255,8 @@ def test_make_tui_argv_keeps_desktop_workspace_install_behaviour(
     assert calls[0][0][0] == [
         "/bin/npm",
         "install",
+        "--workspace",
+        "ui-tui",
         "--silent",
         "--no-fund",
         "--no-audit",
@@ -390,3 +392,76 @@ def test_no_stray_lockfiles_in_workspace_subdirs(main_mod) -> None:
         "delete them and run `npm install` from the repo root instead: "
         + ", ".join(str(d / "package-lock.json") for d in stray)
     )
+
+
+def test_tui_launch_install_uses_workspace_scope(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    """TUI launch npm install must pass --workspace ui-tui to avoid pulling apps/desktop."""
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+    (tui_dir / "dist" / "entry.js").parent.mkdir(parents=True)
+    (tui_dir / "dist" / "entry.js").write_text("console.log('tui')")
+    # workspace root: parent has lockfile, tui_dir does not
+    (tmp_path / "package-lock.json").write_text("{}")
+
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
+    monkeypatch.setattr(main_mod, "_tui_need_rebuild", lambda _root: False)
+    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    npm_calls = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0].endswith("npm"):
+            npm_calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+
+    main_mod._make_tui_argv(tui_dir, tui_dev=False)
+
+    assert npm_calls, "expected npm install to be called"
+    install_cmd = npm_calls[0]
+    assert "--workspace" in install_cmd
+    assert "ui-tui" in install_cmd
+
+def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    """When ui-tui/ has its own package-lock.json, _workspace_root returns
+    tui_dir itself.  npm install --workspace ui-tui would fail in that case
+    because npm cannot find a workspace named "ui-tui" inside ui-tui/.
+    The fix omits --workspace and runs plain npm install from tui_dir.
+    See #42973.
+    """
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+    # Simulate curl-install layout: tui_dir has its own lockfile
+    (tui_dir / "package-lock.json").write_text("{}")
+    # Parent also has lockfile (but _workspace_root prefers tui_dir's own)
+    (tmp_path / "package-lock.json").write_text("{}")
+
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
+    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+
+    main_mod._make_tui_argv(tui_dir, tui_dev=False)
+
+    install_cmd = calls[0][0][0]
+    # Must NOT contain --workspace when npm_cwd == tui_dir
+    assert "--workspace" not in install_cmd, (
+        f"npm install should omit --workspace when tui_dir has its own lockfile, got: {install_cmd}"
+    )
+    assert install_cmd[:2] == ["/bin/npm", "install"]
+    # cwd must be tui_dir (standalone), not parent
+    assert calls[0][1]["cwd"] == str(tui_dir)

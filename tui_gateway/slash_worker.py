@@ -3,15 +3,13 @@
 Protocol: reads JSON lines from stdin {id, command}, writes {id, ok, output|error} to stdout.
 
 Self-protection (defence-in-depth against orphaned workers):
-  1. **Parent watchdog** (best-effort) — if ``psutil`` is available, a daemon
-     thread monitors the parent's PID + create_time fingerprint every 10 s and
-     exits if the parent disappears. This handles crashes, SIGKILL, and PID
-     reuse (critical on Windows).
+  1. **Parent watchdog** — always-on daemon thread using ``psutil`` to check
+     the parent's PID + create_time fingerprint. Configurable poll interval
+     (``HERMES_SLASH_WATCHDOG_POLL_S``, default 2 s) and in-flight grace
+     period (``HERMES_SLASH_WATCHDOG_GRACE_S``, default 5 s) so a running
+     slash command can finish/flush before the worker exits.
   2. **Parent-PID poll** (fallback) — the main loop checks ``os.getppid()``
-     on each stdin timeout; works without ``psutil`` but cannot detect PID reuse.
-  3. **Idle timeout** — exits after ``_IDLE_TIMEOUT_S`` (30 min) without a
-     command, bounding worst-case resource usage even if both parent-orphan
-     guards fail.
+     on each stdin timeout; works even if psutil is somehow not reachable.
 """
 
 import argparse
@@ -23,16 +21,11 @@ import select
 import sys
 import threading
 import time
+import psutil
 
 import cli as cli_mod
 from cli import HermesCLI
 from rich.console import Console
-
-# ── Optional psutil for parent fingerprinting ────────────────────────
-try:
-    import psutil
-except ImportError:
-    psutil = None
 
 # Max seconds of inactivity before the worker self-exits.
 _IDLE_TIMEOUT_S = 1800  # 30 minutes
@@ -40,45 +33,48 @@ _IDLE_TIMEOUT_S = 1800  # 30 minutes
 # How often the stdin poll returns to re-check conditions when idle.
 _POLL_INTERVAL_S = 60
 
-
-def _start_parent_watchdog() -> None:
-    """Start a daemon thread that exits this process if the parent disappears.
-
-    Uses ``psutil.Process(ppid).create_time()`` as a fingerprint to reliably
-    detect parent replacement (PID reuse).  Falls back to no-op when psutil
-    is not installed — the main loop's ``getppid()`` check provides a less
-    robust but dependency-free alternative.
-    """
-    if not psutil:
-        return
-
-    ppid = os.getppid()
+# Env-overridable so the integration test can drive sub-second timing.
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env knob, falling back to ``default`` on absent/malformed
+    values. A bare ``float(os.environ.get(...))`` would raise ValueError at
+    import time on a typo (e.g. ``HERMES_SLASH_WATCHDOG_POLL_S=2s``) and kill
+    the worker before it can serve a single command."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
     try:
-        parent = psutil.Process(ppid)
-        parent_started = parent.create_time()
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        os._exit(0)  # parent already gone
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
-    def _watch() -> None:
-        time.sleep(5)  # let the main process stabilise
-        while True:
-            try:
-                if not psutil.pid_exists(ppid):
-                    os._exit(0)
-                # Fingerprint check — catches PID reuse on Windows / fast-restart
-                if psutil.Process(ppid).create_time() != parent_started:
-                    os._exit(0)
-                # POSIX orphan check: adopted by init
-                if os.name != "nt" and os.getppid() == 1:
-                    os._exit(0)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                os._exit(0)
-            except Exception:
-                pass  # transient psutil error — retry
-            time.sleep(10)
 
-    t = threading.Thread(target=_watch, daemon=True, name="ParentWatchdog")
-    t.start()
+_WATCHDOG_POLL_S = max(0.05, _env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
+_ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
+_in_flight = threading.Event()  # set while a command is executing
+
+
+def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
+    """True once our spawning gateway is gone."""
+    if getppid() != original_ppid:
+        return True
+    try:
+        if not psutil.pid_exists(original_ppid):
+            return True
+        return psutil.Process(original_ppid).create_time() != parent_create_time
+    except psutil.Error:
+        return True
+
+
+def _start_parent_death_watchdog(original_ppid, parent_create_time) -> None:
+    def _loop():
+        while not _is_orphaned(original_ppid, parent_create_time):
+            time.sleep(_WATCHDOG_POLL_S)
+        deadline = time.monotonic() + _ORPHAN_GRACE_S
+        while _in_flight.is_set() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os._exit(0)
+
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 def _run(cli: HermesCLI, command: str) -> str:
@@ -110,8 +106,6 @@ def _run(cli: HermesCLI, command: str) -> str:
 
 
 def main():
-    _start_parent_watchdog()
-
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--session-key", required=True)
     p.add_argument("--model", default="")
@@ -119,6 +113,15 @@ def main():
 
     os.environ["HERMES_SESSION_KEY"] = args.session_key
     os.environ["HERMES_INTERACTIVE"] = "1"
+
+    # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
+    # an orphan risk if the gateway dies mid-spawn.
+    orig_ppid = os.getppid()
+    try:
+        parent_create_time = psutil.Process(orig_ppid).create_time()
+    except psutil.Error:
+        parent_create_time = 0.0
+    _start_parent_death_watchdog(orig_ppid, parent_create_time)
 
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
@@ -159,6 +162,7 @@ def main():
         if not line:
             continue
 
+        _in_flight.set()
         rid = None
         try:
             req = json.loads(line)
@@ -170,6 +174,8 @@ def main():
         except Exception as e:
             sys.stdout.write(json.dumps({"id": rid, "ok": False, "error": str(e)}) + "\n")
             sys.stdout.flush()
+        finally:
+            _in_flight.clear()
 
 
 if __name__ == "__main__":
