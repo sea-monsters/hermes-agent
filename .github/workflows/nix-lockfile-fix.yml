@@ -106,10 +106,17 @@ jobs:
           # rejection silently loses the fix. If package files changed during
           # the rebase, abort — a fresh auto-fix run will handle the new state.
           for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
+            PUSH_OUTPUT=$(git push origin HEAD:main 2>&1) && exit 0
+            echo "::warning::Push attempt $attempt failed, output: $PUSH_OUTPUT"
+
+            # If the push was rejected by branch protection rules on a fork,
+            # log a warning and exit gracefully — the user must merge manually.
+            if echo "$PUSH_OUTPUT" | grep -qiE "protected branch|bypass|required status|merge queue"; then
+              echo "::warning::Protected branch — cannot push directly. Hash fix applied locally."
+              echo "::warning::Run locally: git add nix/lib.nix && git commit -m 'fix(nix): refresh npm lockfile hashes' && git push"
               exit 0
             fi
-            echo "::warning::Push attempt $attempt failed (non-fast-forward?), rebasing…"
+
             git fetch origin main
 
             # If package files changed between our base and the new main,
