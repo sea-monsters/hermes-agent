@@ -1,1 +1,0 @@
-{"score": 8, "reason": "Skill 能正确识别为调试/性能排查类型，Task-Type Template Selection table 明确路由到「调试 spec（假设+验证步骤+时间线）」并加载 systematic-debugging 作为 companion skill；Explore 阶段有详细的审计方法（追踪入口点→调用链→hook 分发→旁路路径），完全契合卡死排查场景。扣分点：调试 spec 仅有描述无具体模板格式，完全依赖外部 skill，且 Error Handling 未覆盖调试特有场景（假设验证失败、指标不明确等）。"}
