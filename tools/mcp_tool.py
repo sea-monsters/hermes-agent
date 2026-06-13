@@ -268,6 +268,38 @@ _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
 })
 
+_SAFE_ENV_KEYS_CASE_INSENSITIVE = frozenset({
+    # Windows process/location vars. These are needed by launcher-style tools
+    # such as Docker Desktop's MCP plugin discovery, and do not carry secrets.
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "COMPUTERNAME",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "PUBLIC",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+})
+
 # Regex for credential patterns to strip from error messages
 _CREDENTIAL_PATTERN = re.compile(
     r"(?:"
@@ -305,7 +337,11 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     """
     env = {}
     for key, value in os.environ.items():
-        if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
+        if (
+            key in _SAFE_ENV_KEYS
+            or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
+            or key.startswith("XDG_")
+        ):
             env[key] = value
     if user_env:
         env.update(user_env)
@@ -1166,6 +1202,26 @@ class MCPServerTask:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
 
+    def _advertises_tools(self) -> bool:
+        """Whether the server advertises the ``tools`` capability.
+
+        Per the MCP spec, ``InitializeResult.capabilities.tools`` is non-None
+        iff the server implements the ``tools/*`` request family. Prompt-only
+        or resource-only servers omit it, and calling ``tools/list`` against
+        them raises ``McpError(-32601 Method not found)`` — which previously
+        killed the connection during discovery and made every keepalive fail.
+        (Ported from anomalyco/opencode#31271.)
+
+        Returns True when no capability info was captured (legacy fallback:
+        preserve the old always-call-list_tools behavior rather than regress
+        any server that was working before this gate).
+        """
+        init_result = self.initialize_result
+        caps = getattr(init_result, "capabilities", None) if init_result is not None else None
+        if caps is None:
+            return True
+        return getattr(caps, "tools", None) is not None
+
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
     async def _refresh_tools_task(self):
@@ -1236,6 +1292,12 @@ class MCPServerTask:
         — atomic from the event loop's perspective.
         """
         from tools.registry import registry
+
+        if not self._advertises_tools():
+            # A server that doesn't implement tools/* should never send
+            # tools/list_changed, but guard anyway — calling tools/list
+            # would raise McpError(-32601).
+            return
 
         async with self._refresh_lock:
             # Capture old tool names for change diff
@@ -1324,12 +1386,22 @@ class MCPServerTask:
 
                 # Timeout — no lifecycle event fired.  Send a keepalive
                 # to exercise the connection and detect stale sockets.
+                # Prompt-only / resource-only servers don't implement
+                # ``tools/list`` (McpError -32601), so use the universal
+                # ``ping`` request for them instead — otherwise every
+                # keepalive cycle would trigger a spurious reconnect.
                 if self.session:
                     try:
-                        await asyncio.wait_for(
-                            self.session.list_tools(),
-                            timeout=30.0,
-                        )
+                        if self._advertises_tools():
+                            await asyncio.wait_for(
+                                self.session.list_tools(),
+                                timeout=30.0,
+                            )
+                        else:
+                            await asyncio.wait_for(
+                                self.session.send_ping(),
+                                timeout=30.0,
+                            )
                     except Exception as exc:
                         logger.warning(
                             "MCP server '%s' keepalive failed, "
@@ -1742,8 +1814,24 @@ class MCPServerTask:
                         )
 
     async def _discover_tools(self):
-        """Discover tools from the connected session."""
+        """Discover tools from the connected session.
+
+        Capability-gated: prompt-only / resource-only MCP servers don't
+        implement ``tools/list``, and calling it raises ``McpError(-32601)``,
+        which previously aborted the connection — those servers could never
+        stay connected for their prompts/resources. Skip the call when the
+        server doesn't advertise the ``tools`` capability.
+        (Ported from anomalyco/opencode#31271.)
+        """
         if self.session is None:
+            return
+        if not self._advertises_tools():
+            logger.info(
+                "MCP server '%s': does not advertise 'tools' capability — "
+                "skipping tools/list (prompts/resources remain available)",
+                self.name,
+            )
+            self._tools = []
             return
         async with self._rpc_lock:
             tools_result = await self.session.list_tools()
@@ -1986,6 +2074,8 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+_server_connecting: set[str] = set()
+_server_connect_errors: Dict[str, str] = {}
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -2372,8 +2462,8 @@ _mcp_tool_server_names: Dict[str, str] = {}
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
-# Protects _mcp_loop, _mcp_thread, _servers, _parallel_safe_servers,
-# _mcp_tool_server_names, and _stdio_pids.
+# Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
+# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
@@ -3517,6 +3607,8 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         timeout=connect_timeout,
     )
     with _lock:
+        _server_connecting.discard(name)
+        _server_connect_errors.pop(name, None)
         _servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
@@ -3563,6 +3655,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             for k, v in servers.items()
             if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
         }
+        _server_connecting.update(new_servers)
+        for srv_name in new_servers:
+            _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
@@ -3590,12 +3685,20 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         for name, result in zip(server_names, results):
             if isinstance(result, BaseException):
                 command = new_servers.get(name, {}).get("command")
+                message = _format_connect_error(result)
+                with _lock:
+                    _server_connecting.discard(name)
+                    _server_connect_errors[name] = message
                 logger.warning(
                     "Failed to connect to MCP server '%s'%s: %s",
                     name,
                     f" (command={command})" if command else "",
-                    _format_connect_error(result),
+                    message,
                 )
+            else:
+                with _lock:
+                    _server_connecting.discard(name)
+                    _server_connect_errors.pop(name, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -3700,8 +3803,10 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
 def get_mcp_status() -> List[dict]:
     """Return status of all configured MCP servers for banner display.
 
-    Returns a list of dicts with keys: name, transport, tools, connected.
-    Includes both successfully connected servers and configured-but-failed ones.
+    Returns a list of dicts with keys: name, transport, tools, connected,
+    disabled, and status. Includes connected servers, disabled servers,
+    in-flight connection attempts, recorded failures, and servers that are
+    configured but have not been started in this process yet.
     """
     result: List[dict] = []
 
@@ -3712,6 +3817,8 @@ def get_mcp_status() -> List[dict]:
 
     with _lock:
         active_servers = dict(_servers)
+        connecting = set(_server_connecting)
+        connect_errors = dict(_server_connect_errors)
 
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
@@ -3724,11 +3831,12 @@ def get_mcp_status() -> List[dict]:
                 "tools": len(server._registered_tool_names) if hasattr(server, "_registered_tool_names") else len(server._tools),
                 "connected": True,
                 "disabled": False,
+                "status": "connected",
             }
             if server._sampling:
                 entry["sampling"] = dict(server._sampling.metrics)
             result.append(entry)
-        else:
+        elif not enabled:
             # A server with enabled: false is intentionally not connected — it is
             # disabled, not failed. Surface that distinction so consumers (banner,
             # TUI) can render "disabled" rather than an alarming "failed".
@@ -3737,7 +3845,36 @@ def get_mcp_status() -> List[dict]:
                 "transport": transport,
                 "tools": 0,
                 "connected": False,
-                "disabled": not enabled,
+                "disabled": True,
+                "status": "disabled",
+            })
+        elif name in connecting:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "connecting",
+            })
+        elif name in connect_errors:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "failed",
+                "error": connect_errors[name],
+            })
+        else:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "configured",
             })
 
     return result
