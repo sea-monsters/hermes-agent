@@ -413,6 +413,12 @@ export interface Translations {
       collapse: string
       connectAnother: string
       otherProviders: string
+      removeConfirm: (provider: string) => string
+      removeExternal: (provider: string, command: string) => string
+      removeKeyManaged: (provider: string) => string
+      removedTitle: string
+      removedMessage: (provider: string) => string
+      failedRemove: (provider: string) => string
       noProviderKeys: string
       loading: string
     }
@@ -540,6 +546,7 @@ export interface Translations {
     back: string
     searchPlaceholder: string
     goTo: string
+    goToSession: string
     commandCenter: string
     appearance: string
     settings: string
@@ -694,6 +701,9 @@ export interface Translations {
     deleting: string
     createDesc: string
     nameLabel: string
+    cloneFrom: string
+    cloneFromNone: string
+    cloneFromDesc: string
     cloneFromDefault: string
     cloneFromDefaultDesc: string
     invalidName: (hint: string) => string
@@ -925,6 +935,8 @@ export interface Translations {
     queueSendNext: string
     queueSend: string
     queueDelete: string
+    queueStuckTitle: string
+    queueStuckBody: string
     previewUnavailable: string
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string
@@ -1312,6 +1324,7 @@ export interface Translations {
   assistant: {
     thread: {
       loadingSession: string
+      showEarlier: string
       loadingResponse: string
       thinking: string
       today: (time: string) => string
@@ -1342,9 +1355,11 @@ export interface Translations {
       gatewayDisconnected: string
       sendFailed: string
       run: string
+      command: string
       moreOptions: string
       allowSession: string
       alwaysAllowMenu: string
+      jumpToApproval: string
       reject: string
       alwaysTitle: string
       alwaysDescription: (pattern: string) => string
