@@ -17,6 +17,7 @@ import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hmac
+import gzip
 import importlib.util
 import json
 import logging
@@ -11007,6 +11008,65 @@ def _normalise_prefix(raw: Optional[str]) -> str:
     return normalise_prefix(raw)
 
 
+# Compression level for gzip: 6 balances speed (higher is slower) vs ratio.
+_GZIP_COMPRESS_LEVEL = 6
+_GZIP_Q_RE = re.compile(r"(?:^|;)\s*q=([0-9]+(?:\.[0-9]+)?)(?:\s|;|$)")
+_GZIP_MALFORMED_Q_RE = re.compile(r"(?:^|;)\s*q\b")
+
+
+def _parse_q_value(params: str) -> float | None:
+    """Extract a valid q-value from content-coding parameters.
+
+    Returns None when no q-value is present. A malformed q (e.g. ``q=``
+    or ``q=abc``) is treated as 0.0 so the encoding is rejected.
+    """
+    m = _GZIP_Q_RE.search(params)
+    if m:
+        return float(m.group(1))
+    if _GZIP_MALFORMED_Q_RE.search(params):
+        return 0.0
+    return None
+
+
+def _accepts_gzip_static(accept_encoding: str) -> bool:
+    """Parse Accept-Encoding header and return True if gzip is accepted (q > 0).
+
+    Handles:
+    - Basic encodings: gzip, x-gzip (RFC 2616 alias)
+    - Quality values: gzip;q=0.5, gzip;q=0 (including spaced: gzip; q=0)
+    - Multiple parameters: gzip;q=0.5;ext=foo
+    - Wildcard with q-values: *;q=1, *;q=0 (RFC 7231 §5.3.4)
+    - Explicit gzip/x-gzip always overrides wildcard, regardless of order
+    - Case insensitive matching
+
+    Shared between serve_css and _OptimizedStaticFiles.
+    """
+    if not accept_encoding:
+        return False
+    wildcard_q: float | None = None
+    for encoding in accept_encoding.split(","):
+        encoding = encoding.strip()
+        if not encoding:
+            continue
+        name, _, params = encoding.partition(";")
+        name = name.strip().lower()
+        q = _parse_q_value(params)
+        if name in ("gzip", "x-gzip"):
+            # Explicit coding: its q is decisive, even if a wildcard
+            # elsewhere in the header says otherwise.
+            if q is None:
+                return True
+            return q > 0.0
+        if name == "*":
+            if q is None:
+                wildcard_q = 1.0
+            else:
+                wildcard_q = q
+    if wildcard_q is not None:
+        return wildcard_q > 0.0
+    return False
+
+
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
@@ -11100,42 +11160,90 @@ def mount_spa(application: FastAPI):
                 css = css.replace(f"url({asset_dir}", f"url({prefix}{asset_dir}")
                 css = css.replace(f"url(\"{asset_dir}", f"url(\"{prefix}{asset_dir}")
                 css = css.replace(f"url('{asset_dir}", f"url('{prefix}{asset_dir}")
-        return Response(content=css, media_type="text/css")
+        # Apply gzip compression + cache headers for CSS assets
+        accept_encoding = request.headers.get("accept-encoding", "")
+        # Always vary on x-forwarded-prefix: CSS representation depends on this
+        # header regardless of whether it's present in the current request.
+        # Without this, a shared cache could serve a no-prefix cached variant
+        # to a prefixed deployment, breaking url() path rewriting.
+        vary_values = ["x-forwarded-prefix"]
+        css_bytes = css.encode("utf-8")
+        if _accepts_gzip_static(accept_encoding):
+            compressed = gzip.compress(css_bytes, compresslevel=_GZIP_COMPRESS_LEVEL)
+            if len(compressed) < len(css_bytes):
+                headers = {
+                    "content-encoding": "gzip",
+                    "vary": ", ".join(["accept-encoding"] + vary_values),
+                    "content-length": str(len(compressed)),
+                    "cache-control": "public, max-age=31536000, immutable",
+                }
+                if request.method == "HEAD":
+                    return Response(headers=headers, media_type="text/css")
+                return Response(content=compressed, headers=headers, media_type="text/css")
+        # Fallback: uncompressed with cache header
+        headers = {
+            "cache-control": "public, max-age=31536000, immutable",
+            "vary": ", ".join(vary_values),
+            "content-length": str(len(css_bytes)),
+        }
+        if request.method == "HEAD":
+            return Response(headers=headers, media_type="text/css")
+        return Response(content=css, headers=headers, media_type="text/css")
 
     # Serve gzip-compressed static files with long-term cache headers.
     # Reduces bandwidth (1.5 MB -> 450 KB for main JS bundle) and allows
     # browser caching since filenames contain content hashes.
     class _OptimizedStaticFiles(StaticFiles):
+        def _accepts_gzip(self, accept_encoding: str) -> bool:
+            return _accepts_gzip_static(accept_encoding)
+
         async def get_response(self, path: str, scope):
             response = await super().get_response(path, scope)
             if path.endswith(".js") or path.endswith(".css"):
                 headers = dict(scope.get("headers", []))
-                accept_encoding = headers.get(b"accept-encoding", b"").decode("latin-1", "")
+                accept_encoding = headers.get(b"accept-encoding", b"").decode("latin-1", "replace")
                 # Add long-term cache header for hashed filenames (e.g. index-XXXX.js)
                 if "content-type" in response.headers:
                     response.headers["cache-control"] = "public, max-age=31536000, immutable"
-                # Gzip compress if client supports it
-                if "gzip" in accept_encoding and isinstance(response, FileResponse):
-                    import gzip
+                # Gzip compress if client supports it (honors q=0)
+                if self._accepts_gzip(accept_encoding) and isinstance(response, FileResponse):
                     file_path = response.path
-                    file_size = os.path.getsize(file_path)
-                    if file_size > 1024:
-                        with open(file_path, "rb") as f:
-                            content = f.read()
-                        compressed = gzip.compress(content, compresslevel=6)
-                        if len(compressed) < len(content):
-                            return Response(
-                                content=compressed,
-                                headers={
-                                    "content-type": response.headers.get("content-type", "application/octet-stream"),
-                                    "content-encoding": "gzip",
-                                    "vary": "accept-encoding",
-                                    "content-length": str(len(compressed)),
-                                    "last-modified": response.headers.get("last-modified", ""),
-                                    "etag": response.headers.get("etag", ""),
-                                    "cache-control": "public, max-age=31536000, immutable",
-                                },
-                            )
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        if file_size > 1024:
+                            with open(file_path, "rb") as f:
+                                content = f.read()
+                            compressed = gzip.compress(content, compresslevel=_GZIP_COMPRESS_LEVEL)
+                            if len(compressed) < len(content):
+                                # Merge Vary header if already present
+                                vary_values = ["accept-encoding"]
+                                original_vary = response.headers.get("vary")
+                                if original_vary:
+                                    vary_values.insert(0, original_vary)
+                                # For HEAD requests, preserve original FileResponse semantics
+                                # (no body) while still setting gzip-related headers
+                                if scope.get("method") == "HEAD":
+                                    response.headers["content-encoding"] = "gzip"
+                                    response.headers["vary"] = ", ".join(vary_values)
+                                    response.headers["content-length"] = str(len(compressed))
+                                    return response
+                                return Response(
+                                    content=compressed,
+                                    headers={
+                                        "content-type": response.headers.get("content-type", "application/octet-stream"),
+                                        "content-encoding": "gzip",
+                                        "vary": ", ".join(vary_values),
+                                        "content-length": str(len(compressed)),
+                                        "last-modified": response.headers.get("last-modified", ""),
+                                        "etag": response.headers.get("etag", ""),
+                                        "cache-control": "public, max-age=31536000, immutable",
+                                    },
+                                )
+                    except (OSError, ValueError):
+                        # If the file disappears or is unreadable after the
+                        # super() response, fall back to the uncompressed
+                        # FileResponse rather than 500-ing the request.
+                        pass
             return response
 
     application.mount("/assets", _OptimizedStaticFiles(directory=WEB_DIST / "assets"), name="assets")
