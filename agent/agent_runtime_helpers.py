@@ -618,12 +618,33 @@ def recover_with_credential_pool(
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
     if current_provider and pool_provider and current_provider != pool_provider:
-        _ra().logger.warning(
-            "Credential pool provider mismatch: pool=%s, agent=%s — "
-            "skipping pool mutation to avoid cross-provider contamination",
-            pool_provider, current_provider,
-        )
-        return False, has_retried_429
+        # Custom endpoints use two naming conventions for the SAME provider:
+        # the agent carries the generic ``custom`` label while the pool is
+        # keyed ``custom:<name>`` (see CUSTOM_POOL_PREFIX). A literal string
+        # compare treats them as a mismatch and skips recovery for every
+        # custom-provider user — 401s/429s then burn the full retry cycle
+        # with no rotation or refresh. Accept the pair as matching only when
+        # the agent's CURRENT base_url actually resolves to this pool key,
+        # so a fallback provider (or a different custom endpoint) still
+        # triggers the guard.
+        _custom_match = False
+        if current_provider == "custom" and pool_provider.startswith("custom:"):
+            try:
+                from agent.credential_pool import get_custom_provider_pool_key
+                _agent_base = (getattr(agent, "base_url", "") or "").strip()
+                _custom_match = bool(_agent_base) and (
+                    (get_custom_provider_pool_key(_agent_base) or "").strip().lower()
+                    == pool_provider
+                )
+            except Exception:
+                _custom_match = False
+        if not _custom_match:
+            _ra().logger.warning(
+                "Credential pool provider mismatch: pool=%s, agent=%s — "
+                "skipping pool mutation to avoid cross-provider contamination",
+                pool_provider, current_provider,
+            )
+            return False, has_retried_429
 
     effective_reason = classified_reason
     if effective_reason is None:
@@ -860,6 +881,8 @@ def try_recover_primary_transport(
 
 def drop_thinking_only_and_merge_users(
     messages: List[Dict[str, Any]],
+    *,
+    drop_codex_reasoning_items: bool = True,
 ) -> List[Dict[str, Any]]:
     """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
 
@@ -881,7 +904,13 @@ def drop_thinking_only_and_merge_users(
         return messages
 
     # Pass 1: drop thinking-only assistant turns.
-    kept = [m for m in messages if not _ra().AIAgent._is_thinking_only_assistant(m)]
+    kept = [
+        m for m in messages
+        if not _ra().AIAgent._is_thinking_only_assistant(
+            m,
+            drop_codex_reasoning_items=drop_codex_reasoning_items,
+        )
+    ]
     dropped = len(messages) - len(kept)
     if dropped == 0:
         return messages
@@ -1188,12 +1217,23 @@ def dump_api_request_debug(
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         dump_file = agent.logs_dir / f"request_dump_{agent.session_id}_{timestamp}.json"
-        atomic_json_write(dump_file, dump_payload, default=str)
+
+        # Redact secrets before persisting/printing. This dump captures the
+        # full request body (system prompt, tool defs, context-embedded
+        # values), and this path fires unconditionally on API errors — so it
+        # otherwise lands any context-embedded secret in cleartext on disk.
+        # Run the serialized dump through the same scrubber used for logs/tool
+        # output, then hand the resulting payload back to the shared atomic
+        # JSON writer so request dumps keep the same write semantics as before.
+        from agent.redact import redact_sensitive_text
+        _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
+        _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
+        atomic_json_write(dump_file, _redacted_payload, default=str)
 
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
 
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
-            print(json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str))
+            print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))
 
         return dump_file
     except Exception as dump_error:
