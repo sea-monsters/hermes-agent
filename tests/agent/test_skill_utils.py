@@ -164,8 +164,9 @@ def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch
     assert get_disabled_skill_names() == {"old-skill"}
 
     config_path.write_text("skills:\n  disabled: [new-skill]\n", encoding="utf-8")
-    import os
-    os.utime(config_path, None)
+    import os, time
+    # Force a different mtime so the mtime+size cache key actually changes.
+    os.utime(config_path, (time.time() + 1, time.time() + 1))
 
     assert get_disabled_skill_names() == {"new-skill"}
 def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
