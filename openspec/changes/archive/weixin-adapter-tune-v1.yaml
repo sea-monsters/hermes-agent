@@ -1,0 +1,27 @@
+id: weixin-adapter-tune-v1
+status: implemented
+date: 2026-06-19
+summary: "4-param tuning of Weixin adapter custom modifications per iLink API spec review"
+tasks:
+  - id: task-1
+    name: "Remove supports_code_blocks override"
+    status: completed
+    files: [gateway/platforms/weixin.py]
+  - id: task-2
+    name: "Increase _batch_max_chars 500→1500"
+    status: completed
+    files: [gateway/platforms/weixin.py]
+  - id: task-3
+    name: "Increase _rate_limit_circuit_threshold 1→3"
+    status: completed
+    files: [gateway/platforms/weixin.py]
+  - id: task-4
+    name: "Fast-fail breaker check before _send_text_gate lock"
+    status: completed
+    files: [gateway/platforms/weixin.py]
+verification:
+  - pytest tests/gateway/test_weixin_typing.py - 13 passed
+  - python3 -m py_compile gateway/platforms/weixin.py - OK
+references:
+  - /tmp/weixin-ilink-review.md (full spec review document)
+commit: d6e864672
