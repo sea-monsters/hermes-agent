@@ -1181,7 +1181,7 @@ async def qr_login(
 class WeixinAdapter(BasePlatformAdapter):
     """Native Hermes adapter for Weixin personal accounts."""
 
-    supports_code_blocks = True  # Weixin renders fenced code blocks
+    # Weixin client does NOT guarantee fenced code block rendering
 
     MAX_MESSAGE_LENGTH = 2000
 
@@ -1222,7 +1222,7 @@ class WeixinAdapter(BasePlatformAdapter):
             1,
             int(
                 extra.get("rate_limit_circuit_threshold")
-                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "1")
+                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "3")
             ),
         )
         self._rate_limit_circuit_window_seconds = float(
@@ -1262,7 +1262,7 @@ class WeixinAdapter(BasePlatformAdapter):
             100,
             int(
                 extra.get("batch_max_chars")
-                or os.getenv("WEIXIN_BATCH_MAX_CHARS", "500")
+                or os.getenv("WEIXIN_BATCH_MAX_CHARS", "1500")
             ),
         )
         self._batch_inter_chunk_delay_seconds = float(
@@ -1772,7 +1772,13 @@ class WeixinAdapter(BasePlatformAdapter):
         *without* ``context_token`` — iLink accepts tokenless sends as a
         degraded fallback, which keeps cron-initiated push messages working
         even when no user message has refreshed the session recently.
+
+        Fast-fails before acquiring the gate lock when the circuit breaker
+        is open — no point serialising behind a lock when every sender will
+        be rejected anyway.
         """
+        if self._rate_limit_cooldown_remaining() > 0:
+            raise self._rate_limit_error()
         async with self._send_text_gate:
             await self._send_text_chunk_locked(
                 chat_id=chat_id,
