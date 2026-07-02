@@ -920,49 +920,6 @@ def _split_text_for_weixin_delivery(
     return _pack_markdown_blocks_for_weixin(content, max_length) or [content]
 
 
-def _batch_chunks(chunks: List[str], max_chars: int) -> List[str]:
-    """Merge sequential text chunks into batches under max_chars limit.
-
-    Chunks are joined with ``\n\n`` to preserve Markdown block separation.
-    A single chunk that already exceeds max_chars is emitted as-is (caller
-    should truncate separately).  The final batch is always flushed even if
-    it is under the limit.
-    """
-    if not chunks:
-        return []
-    batches: List[str] = []
-    current: List[str] = []
-    current_len = 0
-    separator_len = 2  # len("\n\n")
-
-    for chunk in chunks:
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        chunk_len = len(chunk)
-        # If this chunk alone exceeds max_chars, flush current batch first
-        if chunk_len > max_chars:
-            if current:
-                batches.append("\n\n".join(current))
-                current = []
-                current_len = 0
-            batches.append(chunk)
-            continue
-        # Check if adding this chunk would exceed max_chars
-        projected = current_len + (separator_len if current else 0) + chunk_len
-        if projected > max_chars and current:
-            batches.append("\n\n".join(current))
-            current = [chunk]
-            current_len = chunk_len
-        else:
-            current.append(chunk)
-            current_len = projected
-
-    if current:
-        batches.append("\n\n".join(current))
-    return batches
-
-
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce a config value to bool, tolerating strings like ``"true"``."""
     if value is None:
@@ -1181,7 +1138,8 @@ async def qr_login(
 class WeixinAdapter(BasePlatformAdapter):
     """Native Hermes adapter for Weixin personal accounts."""
 
-    # Weixin client does NOT guarantee fenced code block rendering
+    supports_code_blocks = True  # Weixin renders fenced code blocks
+    splits_long_messages = True  # send() chunks via _split_text()
 
     MAX_MESSAGE_LENGTH = 2000
 
@@ -1222,7 +1180,7 @@ class WeixinAdapter(BasePlatformAdapter):
             1,
             int(
                 extra.get("rate_limit_circuit_threshold")
-                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "3")
+                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "1")
             ),
         )
         self._rate_limit_circuit_window_seconds = float(
@@ -1235,7 +1193,7 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "pairing")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
         if allow_from is None:
@@ -1249,25 +1207,6 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("split_multiline_messages")
             or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
             default=False,
-        )
-
-        # Outbound batch merge: coalesce sequential text chunks into fewer
-        # iLink sendmessage calls to reduce rate-limit pressure.
-        self._batch_merge_enabled = _coerce_bool(
-            extra.get("batch_merge_enabled")
-            or os.getenv("WEIXIN_BATCH_MERGE_ENABLED"),
-            default=False,
-        )
-        self._batch_max_chars = max(
-            100,
-            int(
-                extra.get("batch_max_chars")
-                or os.getenv("WEIXIN_BATCH_MAX_CHARS", "1500")
-            ),
-        )
-        self._batch_inter_chunk_delay_seconds = float(
-            extra.get("batch_inter_chunk_delay_seconds")
-            or os.getenv("WEIXIN_BATCH_INTER_CHUNK_DELAY_SECONDS", "0.5")
         )
 
         # Text debounce batching (mirrors Telegram adapter pattern).
@@ -1322,7 +1261,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not check_weixin_requirements():
             message = "Weixin startup failed: aiohttp and cryptography are required"
             self._set_fatal_error("weixin_missing_dependency", message, retryable=False)
@@ -1488,7 +1427,9 @@ class WeixinAdapter(BasePlatformAdapter):
                 return
             if self._group_policy == "allowlist" and effective_chat_id not in self._group_allow_from:
                 return
-        elif not self._is_dm_allowed(sender_id):
+            if self._group_policy == "pairing":
+                return
+        elif not self._is_dm_intake_allowed(sender_id):
             return
 
         context_token = str(message.get("context_token") or "").strip()
@@ -1531,12 +1472,30 @@ class WeixinAdapter(BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
+    def _open_dm_opted_in(self) -> bool:
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+            return True
+        return os.getenv("WEIXIN_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
             return sender_id in self._allow_from
-        return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
+
+    def _is_dm_intake_allowed(self, sender_id: str) -> bool:
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return sender_id in self._allow_from
+        if self._dm_policy == "pairing":
+            return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -1772,13 +1731,7 @@ class WeixinAdapter(BasePlatformAdapter):
         *without* ``context_token`` — iLink accepts tokenless sends as a
         degraded fallback, which keeps cron-initiated push messages working
         even when no user message has refreshed the session recently.
-
-        Fast-fails before acquiring the gate lock when the circuit breaker
-        is open — no point serialising behind a lock when every sender will
-        be rejected anyway.
         """
-        if self._rate_limit_cooldown_remaining() > 0:
-            raise self._rate_limit_error()
         async with self._send_text_gate:
             await self._send_text_chunk_locked(
                 chat_id=chat_id,
@@ -1934,8 +1887,6 @@ class WeixinAdapter(BasePlatformAdapter):
 
             # Deliver text content.
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
-            if self._batch_merge_enabled:
-                chunks = _batch_chunks(chunks, self._batch_max_chars)
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
                 await self._send_text_chunk(
@@ -1945,9 +1896,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     client_id=client_id,
                 )
                 last_message_id = client_id
-                if idx < len(chunks) - 1 and self._batch_merge_enabled and self._batch_inter_chunk_delay_seconds > 0:
-                    await asyncio.sleep(self._batch_inter_chunk_delay_seconds)
-                elif idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
+                if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
