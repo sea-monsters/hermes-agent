@@ -1,6 +1,5 @@
 import { billingCommands } from './commands/billing.js'
 import { coreCommands } from './commands/core.js'
-import { billingCommands } from './commands/billing.js'
 import { creditsCommands } from './commands/credits.js'
 import { debugCommands } from './commands/debug.js'
 import { opsCommands } from './commands/ops.js'
