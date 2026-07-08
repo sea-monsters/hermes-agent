@@ -218,7 +218,6 @@ def test_cron_provider_package_does_not_shadow_core_cron_package(monkeypatch):
     repo_root = Path(__file__).resolve().parents[2]
 
     monkeypatch.syspath_prepend(str(repo_root))
-    monkeypatch.syspath_prepend(str(repo_root / "plugins"))
 
     cron_spec = PathFinder.find_spec("cron")
     assert cron_spec is not None
