@@ -27,6 +27,7 @@ hermes_bootstrap.harden_import_path()
 
 import argparse
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -38,6 +39,7 @@ import psutil
 
 import cli as cli_mod
 from cli import HermesCLI
+from tui_gateway._stdin_recovery import handle_spurious_eof
 from rich.console import Console
 
 # Max seconds of inactivity before the worker self-exits.
@@ -78,9 +80,30 @@ def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
         return True
 
 
-def _start_parent_death_watchdog(original_ppid, parent_create_time) -> None:
+def _prepare_slash_worker_runtime() -> None:
+    """Start bounded MCP discovery before HermesCLI snapshots tools.
+
+    Each slash_worker child is its own process — the parent ``hermes serve``
+    discovery thread does not populate this registry (issue #61891).
+    """
+    import logging
+
+    from hermes_cli.mcp_startup import (
+        start_background_mcp_discovery,
+        wait_for_mcp_discovery,
+    )
+
+    logger = logging.getLogger(__name__)
+    start_background_mcp_discovery(
+        logger=logger,
+        thread_name="slash-worker-mcp-discovery",
+    )
+    wait_for_mcp_discovery()
+
+
+def _start_parent_death_watchdog(original_ppid) -> None:
     def _loop():
-        while not _is_orphaned(original_ppid, parent_create_time):
+        while not _is_orphaned(original_ppid):
             time.sleep(_WATCHDOG_POLL_S)
         deadline = time.monotonic() + _ORPHAN_GRACE_S
         while _in_flight.is_set() and time.monotonic() < deadline:
@@ -137,34 +160,32 @@ def main():
     # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
     # an orphan risk if the gateway dies mid-spawn.
     orig_ppid = os.getppid()
-    try:
-        parent_create_time = psutil.Process(orig_ppid).create_time()
-    except psutil.Error:
-        parent_create_time = 0.0
-    _start_parent_death_watchdog(orig_ppid, parent_create_time)
+    _start_parent_death_watchdog(orig_ppid)
+    _prepare_slash_worker_runtime()
 
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
 
     parent_pid = os.getppid()
     last_command_time = time.monotonic()
+    _sw_recovery_times: list[float] = []
+
+    def _sw_log(reason: str) -> None:
+        print(f"[slash-worker] {reason}", file=sys.stderr, flush=True)
 
     while True:
-        # Guard 1: parent-PID check (works without psutil, covers basic
-        # orphan scenarios but not PID reuse).
+        # Guard 1: parent-PID check (covers basic orphan scenarios).
         if os.getppid() != parent_pid:
             break
 
         # Guard 2: idle timeout — bounds resource use when the upstream
-        # cleanup path (close_on_disconnect + server-side teardown) misses
-        # a code path.
+        # cleanup path misses a code path.
         idle = time.monotonic() - last_command_time
         if idle >= _IDLE_TIMEOUT_S:
             break
 
         # Poll stdin with a timeout so we can periodically re-check the
-        # conditions above. Without this, a blocking ``for raw in sys.stdin``
-        # would hang forever if the pipe is left open.
+        # conditions above.
         poll_timeout = min(_POLL_INTERVAL_S, _IDLE_TIMEOUT_S - idle)
         try:
             r, _, _ = select.select([sys.stdin], [], [], poll_timeout)
@@ -176,7 +197,11 @@ def main():
 
         raw = sys.stdin.readline()
         if not raw:
-            break  # EOF — stdin closed
+            # Spurious stdin-EOF recovery — same O_NONBLOCK shared
+            # file-description issue as the gateway entry point.
+            if not handle_spurious_eof(_sw_recovery_times, _sw_log):
+                break
+            continue
 
         line = raw.strip()
         if not line:
