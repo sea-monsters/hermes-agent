@@ -24,7 +24,7 @@ def _add_server_runtime_args(parser) -> None:
     browser-opening behavior and help framing differ.
     """
     parser.add_argument(
-        "--port", type=int, default=9119, help="Port (default 9119, 0 for auto-assign by OS)"
+        "--port", type=int, default=8089, help="Port (default 8089, 0 for auto-assign by OS)"
     )
     parser.add_argument(
         "--host", default="127.0.0.1", help="Host (default 127.0.0.1)"
