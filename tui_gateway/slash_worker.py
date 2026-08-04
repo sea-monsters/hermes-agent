@@ -3,13 +3,13 @@
 Protocol: reads JSON lines from stdin {id, command}, writes {id, ok, output|error} to stdout.
 
 Self-protection (defence-in-depth against orphaned workers):
-  1. **Parent watchdog** — always-on daemon thread using ``psutil`` to check
-     the parent's PID + create_time fingerprint. Configurable poll interval
+  1. **Parent watchdog** — always-on daemon thread that checks the parent
+     PID via ``os.getppid()``. Configurable poll interval
      (``HERMES_SLASH_WATCHDOG_POLL_S``, default 2 s) and in-flight grace
      period (``HERMES_SLASH_WATCHDOG_GRACE_S``, default 5 s) so a running
      slash command can finish/flush before the worker exits.
   2. **Parent-PID poll** (fallback) — the main loop checks ``os.getppid()``
-     on each stdin timeout; works even if psutil is somehow not reachable.
+     on each stdin timeout.
 """
 
 # Stop a ``utils/`` (or ``proxy/``, ``ui/``) package in the launch directory
@@ -36,7 +36,6 @@ import select
 import sys
 import threading
 import time
-import psutil
 
 import cli as cli_mod
 from cli import HermesCLI
@@ -70,16 +69,9 @@ _in_flight = threading.Event()  # set while a command is executing
 logger = logging.getLogger(__name__)
 
 
-def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
-    """True once our spawning gateway is gone."""
-    if getppid() != original_ppid:
-        return True
-    try:
-        if not psutil.pid_exists(original_ppid):
-            return True
-        return psutil.Process(original_ppid).create_time() != parent_create_time
-    except psutil.Error:
-        return True
+def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
+    """Return whether this worker no longer has its original POSIX parent."""
+    return getppid() != original_ppid
 
 
 def _prepare_slash_worker_runtime() -> None:
