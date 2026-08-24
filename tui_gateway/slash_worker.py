@@ -1,15 +1,6 @@
 """Persistent slash-command worker — one HermesCLI per TUI session.
 
 Protocol: reads JSON lines from stdin {id, command}, writes {id, ok, output|error} to stdout.
-
-Self-protection (defence-in-depth against orphaned workers):
-  1. **Parent watchdog** — always-on daemon thread that checks the parent
-     PID via ``os.getppid()``. Configurable poll interval
-     (``HERMES_SLASH_WATCHDOG_POLL_S``, default 2 s) and in-flight grace
-     period (``HERMES_SLASH_WATCHDOG_GRACE_S``, default 5 s) so a running
-     slash command can finish/flush before the worker exits.
-  2. **Parent-PID poll** (fallback) — the main loop checks ``os.getppid()``
-     on each stdin timeout.
 """
 
 # Stop a ``utils/`` (or ``proxy/``, ``ui/``) package in the launch directory
@@ -27,12 +18,10 @@ hermes_bootstrap.harden_import_path()
 
 import argparse
 import contextlib
-import inspect
 import io
 import json
 import logging
 import os
-import select
 import sys
 import threading
 import time
@@ -41,12 +30,6 @@ import cli as cli_mod
 from cli import HermesCLI
 from tui_gateway._stdin_recovery import handle_spurious_eof
 from rich.console import Console
-
-# Max seconds of inactivity before the worker self-exits.
-_IDLE_TIMEOUT_S = 1800  # 30 minutes
-
-# How often the stdin poll returns to re-check conditions when idle.
-_POLL_INTERVAL_S = 60
 
 # Env-overridable so the integration test can drive sub-second timing.
 def _env_float(name: str, default: float) -> float:
@@ -101,7 +84,7 @@ def _start_parent_death_watchdog(original_ppid) -> None:
             time.sleep(_WATCHDOG_POLL_S)
         deadline = time.monotonic() + _ORPHAN_GRACE_S
         while _in_flight.is_set() and time.monotonic() < deadline:
-            time.sleep(0.05)
+            time.sleep(0.05)  # let an in-flight command finish/flush
         os._exit(0)
 
     threading.Thread(target=_loop, daemon=True).start()
@@ -160,39 +143,17 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
 
-    parent_pid = os.getppid()
-    last_command_time = time.monotonic()
+    # Spurious stdin-EOF recovery (same O_NONBLOCK shared file-description
+    # issue as the gateway entry point — any child inheriting fd 0 can flip
+    # the flag and launder EAGAIN into an apparent EOF).
     _sw_recovery_times: list[float] = []
 
     def _sw_log(reason: str) -> None:
         print(f"[slash-worker] {reason}", file=sys.stderr, flush=True)
 
     while True:
-        # Guard 1: parent-PID check (covers basic orphan scenarios).
-        if os.getppid() != parent_pid:
-            break
-
-        # Guard 2: idle timeout — bounds resource use when the upstream
-        # cleanup path misses a code path.
-        idle = time.monotonic() - last_command_time
-        if idle >= _IDLE_TIMEOUT_S:
-            break
-
-        # Poll stdin with a timeout so we can periodically re-check the
-        # conditions above.
-        poll_timeout = min(_POLL_INTERVAL_S, _IDLE_TIMEOUT_S - idle)
-        try:
-            r, _, _ = select.select([sys.stdin], [], [], poll_timeout)
-        except (ValueError, OSError):
-            break  # stdin closed or invalid
-
-        if not r:
-            continue  # Timeout — loop back to check parent/idle
-
         raw = sys.stdin.readline()
         if not raw:
-            # Spurious stdin-EOF recovery — same O_NONBLOCK shared
-            # file-description issue as the gateway entry point.
             if not handle_spurious_eof(_sw_recovery_times, _sw_log):
                 break
             continue
@@ -209,7 +170,6 @@ def main():
             out = _run(cli, req.get("command", ""))
             sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": out}) + "\n")
             sys.stdout.flush()
-            last_command_time = time.monotonic()
         except Exception as e:
             sys.stdout.write(json.dumps({"id": rid, "ok": False, "error": str(e)}) + "\n")
             sys.stdout.flush()
