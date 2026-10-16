@@ -213,6 +213,7 @@ env:
 
 jobs:
   validate:
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Pre-build setup
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
@@ -1696,6 +1697,7 @@ jobs:
         smoke-win32-x64
       ]
     if: >-
+      github.repository == 'NousResearch/hermes-agent' && (
       !cancelled() && needs.validate.outputs.channel-build != '' && needs.validate.result == 'success'
       && needs.validate.outputs.darwin-arm64 == 'true' && needs.validate.outputs.darwin-x64 == 'true'
       && needs.validate.outputs.win32-arm64 == 'true' && needs.validate.outputs.win32-x64 == 'true'
@@ -1705,6 +1707,7 @@ jobs:
       && needs.assemble-win32-bundle.result == 'success'
       && needs.smoke-darwin-arm64.result == 'success' && needs.smoke-darwin-x64.result == 'success'
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
+      )
     runs-on: ubuntu-24.04
     environment: release-signing
     cache-mode: read
@@ -1747,6 +1750,7 @@ jobs:
     name: Publish the tested Windows canary bundle
     needs: [validate, assemble-win32-bundle, smoke-win32-arm64, smoke-win32-x64]
     if: >-
+      github.repository == 'NousResearch/hermes-agent' && (
       !cancelled() && inputs.build_commit == '' && inputs.channel == '' && inputs.upload_release == true
       && inputs.release-phase == ''
       && needs.validate.outputs.win32-arm64 == 'true' && needs.validate.outputs.win32-x64 == 'true'
@@ -1754,6 +1758,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.assemble-win32-bundle.result == 'success'
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
+      )
     runs-on: ubuntu-24.04
     environment: release-signing
     timeout-minutes: 15
@@ -1828,12 +1833,14 @@ jobs:
     name: Publish the macOS updater feed
     needs: [validate, build-darwin-arm64, build-darwin-x64, smoke-darwin-arm64, smoke-darwin-x64]
     if: >-
+      github.repository == 'NousResearch/hermes-agent' && (
       !cancelled() && inputs.build_commit == '' && inputs.channel == '' && inputs.upload_release == true
       && inputs.release-phase == ''
       && needs.validate.outputs.darwin-arm64 == 'true' && needs.validate.outputs.darwin-x64 == 'true'
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.build-darwin-arm64.result == 'success' && needs.build-darwin-x64.result == 'success'
       && needs.smoke-darwin-arm64.result == 'success' && needs.smoke-darwin-x64.result == 'success'
+      )
     runs-on: ubuntu-24.04
     environment: release-signing
     timeout-minutes: 15
@@ -1895,7 +1902,7 @@ jobs:
   termux-deb:
     name: Build + publish the termux .deb (aarch64)
     needs: [validate]
-    if: inputs.channel == '' && inputs.disposable_channel == '' && needs.validate.outputs.termux == 'true' && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '')
+    if: github.repository == 'NousResearch/hermes-agent' && (inputs.channel == '' && inputs.disposable_channel == '' && needs.validate.outputs.termux == 'true' && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != ''))
     runs-on: ubuntu-24.04-arm
     environment: release-signing
     timeout-minutes: 90
@@ -2266,7 +2273,7 @@ jobs:
     name: Mark the builds table as in progress
     needs: validate
     # Pairs with builds-table: a pending page nothing finalizes must not be written.
-    if: inputs.build_commit == '' && inputs.upload_release == true && needs.validate.outputs.all-jobs == 'true'
+    if: github.repository == 'NousResearch/hermes-agent' && (inputs.build_commit == '' && inputs.upload_release == true && needs.validate.outputs.all-jobs == 'true')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -2309,9 +2316,11 @@ jobs:
     # Failed builds still get a per-tag diagnostic page. The renderer only
     # advances the channel landing page when every prerequisite succeeded.
     if: |
+      github.repository == 'NousResearch/hermes-agent' && (
       always() && inputs.build_commit == '' && inputs.channel == '' && inputs.upload_release == true && inputs.release-phase == ''
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.all-jobs == 'true'
+      )
     runs-on: ubuntu-24.04
     environment: release-signing
     steps:
@@ -2367,9 +2376,11 @@ jobs:
         termux-deb
       ]
     if: |
+      github.repository == 'NousResearch/hermes-agent' && (
       always() && inputs.build_commit != '' && inputs.channel == '' && inputs.disposable_channel == ''
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.all-jobs == 'true'
+      )
     runs-on: ubuntu-24.04
     environment: release-signing
     permissions:
@@ -2429,7 +2440,7 @@ jobs:
   stable-publish:
     name: Verify published candidate files
     needs: validate
-    if: inputs.release-phase == 'publish'
+    if: github.repository == 'NousResearch/hermes-agent' && (inputs.release-phase == 'publish')
     runs-on: ubuntu-latest-32-core
     environment: release-signing
     timeout-minutes: 90
@@ -2455,7 +2466,7 @@ jobs:
   stable-store:
     name: Submit the verified Store package
     needs: [validate, stable-publish]
-    if: inputs.release-phase == 'publish' && inputs.skip-store != true
+    if: github.repository == 'NousResearch/hermes-agent' && (inputs.release-phase == 'publish' && inputs.skip-store != true)
     # The Store is not a release gate: a failed submission leaves the release publishable
     # and the summary names the Store package for a manual Partner Center upload.
     continue-on-error: true
@@ -2508,7 +2519,7 @@ jobs:
 
   stable-phase-result:
     name: Stable bundle phase completed
-    if: always() && inputs.release-phase != ''
+    if: github.repository == 'NousResearch/hermes-agent' && (always() && inputs.release-phase != '')
     needs:
       [
         validate,
@@ -2570,6 +2581,7 @@ jobs:
         publish-darwin-updater
       ]
     if: |
+      github.repository == 'NousResearch/hermes-agent' && (
       always()
       && inputs.build_commit == '' && inputs.channel == ''
       && inputs.upload_release == true
@@ -2587,6 +2599,7 @@ jobs:
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
       && needs.publish-win32-updater.result == 'success'
       && needs.publish-darwin-updater.result == 'success'
+      )
     runs-on: ubuntu-24.04
     environment: release-signing
     steps:

@@ -32,6 +32,7 @@ concurrency:
 
 jobs:
   admit:
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Admit the claim
     # A read token cannot see a draft release, so gh release view answers
     # "release not found" for a draft that exists. Write is the permission
@@ -398,7 +399,7 @@ jobs:
     # The recorded smoke results are the calls' own workflow results: a
     # call's stable-phase-result fails when its smokes fail, so a failed
     # smoke fails this job's RELEASE_NEEDS check and stages no manifest.
-    if: always() && fromJSON(needs.admit.outputs.jobs)['candidate-manifest']
+    if: github.repository == 'NousResearch/hermes-agent' && (always() && fromJSON(needs.admit.outputs.jobs)['candidate-manifest'])
     needs: [admit, candidates-darwin-arm64, candidates-darwin-x64, candidates-win32-arm64,
             candidates-win32-x64, candidates-win32-bundle, candidates-termux]
     runs-on: ubuntu-24.04
@@ -522,7 +523,7 @@ jobs:
 
   acceptance:
     name: All release acceptance checks pass
-    if: always()
+    if: github.repository == 'NousResearch/hermes-agent' && (always())
     needs: [admit, ci, docker, nix, pm-bundle, termux-checks, windows-live, install-e2e,
             candidates-darwin-arm64, candidates-darwin-x64, candidates-win32-arm64,
             candidates-win32-x64, candidates-win32-bundle, candidates-termux,
@@ -547,7 +548,7 @@ jobs:
     # B5: this job pushes only the immutable attempt-ref image tags; the
     # stable/latest aliases move in the ordered publication pass.
     needs: [admit, docker]
-    if: fromJSON(needs.admit.outputs.jobs)['publish-docker']
+    if: github.repository == 'NousResearch/hermes-agent' && (fromJSON(needs.admit.outputs.jobs)['publish-docker'])
     uses: ./.github/workflows/docker.yml
     secrets: inherit
     with:
@@ -563,8 +564,10 @@ jobs:
     # baseline (the first bundled release). Without !cancelled() that skip propagates here and
     # publication then refuses publish-bundles=skipped. acceptance itself is the gate.
     if: >-
+      github.repository == 'NousResearch/hermes-agent' && (
       !cancelled() && fromJSON(needs.admit.outputs.jobs)['publish-bundles']
       && needs.acceptance.result == 'success' && needs.candidate-manifest.result == 'success'
+      )
     permissions:
       contents: write
       actions: read
@@ -582,7 +585,7 @@ jobs:
 
   publication:
     name: All artifact publication succeeded
-    if: always()
+    if: github.repository == 'NousResearch/hermes-agent' && (always())
     needs: [admit, acceptance, publish-docker, publish-bundles]
     runs-on: ubuntu-24.04
     steps:
@@ -599,7 +602,7 @@ jobs:
 
   complete:
     name: Stable release is green
-    if: always()
+    if: github.repository == 'NousResearch/hermes-agent' && (always())
     needs: [admit, ci, docker, acceptance, candidate-manifest, publication, publish-docker,
             windows-packaged, macos-packaged-arm64, macos-packaged-x64]
     runs-on: ubuntu-24.04

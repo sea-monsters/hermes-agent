@@ -529,7 +529,7 @@ jobs:
   # login/push fails loudly (missing credentials) instead of faking green.
   release-publish:
     name: Publish tested Docker image (${{ matrix.variant }}/${{ matrix.arch }})
-    if: needs.mode.outputs.phase == 'publish'
+    if: github.repository == 'NousResearch/hermes-agent' && (needs.mode.outputs.phase == 'publish')
     needs: [mode]
     environment: container-publish
     strategy:
@@ -626,7 +626,7 @@ jobs:
   # to the parent release receipt. Registry-side only; nothing is rebuilt.
   release-publish-manifest:
     name: Assemble versioned manifest and digest receipt
-    if: needs.mode.outputs.phase == 'publish'
+    if: github.repository == 'NousResearch/hermes-agent' && (needs.mode.outputs.phase == 'publish')
     needs: [mode, release-publish]
     runs-on: ubuntu-latest
     outputs:
@@ -758,7 +758,7 @@ jobs:
   # publisher turns this red instead of letting the phase go green.
   release-phase-gate:
     name: Docker phase requirements met
-    if: always() && inputs.release-phase != ''
+    if: (github.repository == 'NousResearch/hermes-agent' || inputs.release-phase != 'publish') && (always() && inputs.release-phase != '')
     needs: [mode, build, release-publish, release-publish-manifest]
     runs-on: ubuntu-latest
     timeout-minutes: 5
